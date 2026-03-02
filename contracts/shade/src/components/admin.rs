@@ -74,12 +74,27 @@ pub fn is_accepted_token(env: &Env, token: &Address) -> bool {
     contains_token(&get_accepted_tokens(env), token)
 }
 
+fn contains_token(accepted_tokens: &Vec<Address>, token: &Address) -> bool {
+    for accepted_token in accepted_tokens.iter() {
+        if accepted_token == *token {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn set_account_wasm_hash(env: &Env, admin: &Address, wasm_hash: &soroban_sdk::BytesN<32>) {
     reentrancy::enter(env);
     core::assert_admin(env, admin);
     env.storage()
         .persistent()
         .set(&DataKey::AccountWasmHash, wasm_hash);
+    events::publish_account_wasm_hash_set_event(
+        env,
+        admin.clone(),
+        wasm_hash.clone(),
+        env.ledger().timestamp(),
+    );
     reentrancy::exit(env);
 }
 
@@ -134,13 +149,4 @@ fn get_accepted_tokens(env: &Env) -> Vec<Address> {
         .persistent()
         .get(&DataKey::AcceptedTokens)
         .unwrap_or_else(|| Vec::new(env))
-}
-
-fn contains_token(accepted_tokens: &Vec<Address>, token: &Address) -> bool {
-    for accepted_token in accepted_tokens.iter() {
-        if accepted_token == *token {
-            return true;
-        }
-    }
-    false
 }

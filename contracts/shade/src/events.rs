@@ -550,3 +550,24 @@ pub fn publish_subscription_cancelled_event(
     }
     .publish(env);
 }
+
+#[contractevent]
+pub struct AccountWasmHashSetEvent {
+    pub admin: Address,
+    pub wasm_hash: BytesN<32>,
+    pub timestamp: u64,
+}
+
+pub fn publish_account_wasm_hash_set_event(
+    env: &Env,
+    admin: Address,
+    wasm_hash: BytesN<32>,
+    timestamp: u64,
+) {
+    AccountWasmHashSetEvent {
+        admin,
+        wasm_hash,
+        timestamp,
+    }
+    .publish(env);
+}
