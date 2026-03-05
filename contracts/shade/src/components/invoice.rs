@@ -2,6 +2,7 @@ use crate::components::{access_control, admin, merchant, signature_util};
 use crate::errors::ContractError;
 use crate::events;
 use crate::types::{DataKey, Invoice, InvoiceFilter, InvoiceStatus, Role};
+use soroban_sdk::token::TokenClient;
 use soroban_sdk::{contractclient, panic_with_error, token, Address, BytesN, Env, String, Vec};
 
 #[contractclient(name = "MerchantAccountRefundClient")]
@@ -25,6 +26,20 @@ pub fn create_invoice(
     }
     if !merchant::is_merchant(env, merchant_address) {
         panic_with_error!(env, ContractError::NotAuthorized);
+    }
+    if !admin::is_accepted_token(env, token) {
+        panic_with_error!(env, ContractError::TokenNotAccepted);
+    }
+    // check if expires_at is valid
+    if let Some(expires_at) = expires_at {
+        if expires_at < env.ledger().timestamp() {
+            panic_with_error!(env, ContractError::InvoiceExpired);
+        }
+    }
+    // check if amount is less than fee amount for the token
+    let fee_amount = admin::get_fee(env, token);
+    if amount <= fee_amount {
+        panic_with_error!(env, ContractError::InvalidAmount);
     }
     let merchant_id: u64 = merchant::get_merchant_id(env, merchant_address);
     let invoice_count: u64 = env
@@ -74,23 +89,32 @@ pub fn create_invoice_signed(
     nonce: &BytesN<32>,
     signature: &BytesN<64>,
 ) -> u64 {
-    // 1. Caller must be Manager or Admin
+    // Caller must be Manager or Admin
     if !access_control::has_role(env, caller, Role::Manager) {
         panic_with_error!(env, ContractError::NotAuthorized);
     }
     caller.require_auth();
 
-    // 2. Validate amount
+    // Validate amount
     if amount <= 0 {
         panic_with_error!(env, ContractError::InvalidAmount);
     }
 
-    // 3. Merchant must exist
+    // Merchant must exist
     if !merchant::is_merchant(env, merchant) {
         panic_with_error!(env, ContractError::MerchantNotFound);
     }
 
-    // 4. Verify merchant's cryptographic signature
+    if !admin::is_accepted_token(env, token) {
+        panic_with_error!(env, ContractError::TokenNotAccepted);
+    }
+    // check if amount is less than fee amount for the token
+    let fee_amount = admin::get_fee(env, token);
+    if amount <= fee_amount {
+        panic_with_error!(env, ContractError::InvalidAmount);
+    }
+
+    // Verify merchant's cryptographic signature
     signature_util::verify_invoice_signature(
         env,
         merchant,
@@ -156,15 +180,23 @@ pub fn get_invoice(env: &Env, invoice_id: u64) -> Invoice {
         .unwrap_or_else(|| panic_with_error!(env, ContractError::InvoiceNotFound))
 }
 
-pub fn refund_invoice(env: &Env, merchant_address: &Address, invoice_id: u64) {
-    merchant_address.require_auth();
-
+pub fn check_invoice_refund_eligibility(env: &Env, merchant_address: &Address, invoice_id: u64) {
     let invoice = get_invoice(env, invoice_id);
 
     let merchant_id = merchant::get_merchant_id(env, merchant_address);
 
     if invoice.merchant_id != merchant_id {
         panic_with_error!(env, ContractError::NotAuthorized);
+    }
+
+    // check if the payer is available
+    if invoice.payer.is_none() {
+        panic_with_error!(env, ContractError::PayerNotAvailable);
+    }
+
+    // check if invoice is paid
+    if invoice.status != InvoiceStatus::Paid {
+        panic_with_error!(env, ContractError::InvoiceNotPaid);
     }
 
     // Enforce refund window
@@ -181,8 +213,44 @@ pub fn refund_invoice(env: &Env, merchant_address: &Address, invoice_id: u64) {
     if amount_to_refund <= 0 {
         panic_with_error!(env, ContractError::InvalidAmount);
     }
+}
 
-    refund_invoice_partial(env, invoice_id, amount_to_refund);
+pub fn refund_invoice(env: &Env, merchant_address: &Address, invoice_id: u64) {
+    merchant_address.require_auth();
+
+    check_invoice_refund_eligibility(env, merchant_address, invoice_id);
+
+    // initiate refund
+    let invoice = get_invoice(env, invoice_id);
+    let amount_to_refund = invoice.amount - invoice.amount_refunded;
+
+    let payer = invoice.payer.unwrap();
+    // transfer amount_to_refund from merchant account to payer
+    // check if merchant account balance for the token is sufficient
+    let merchant_account = merchant::get_merchant_account(env, invoice.merchant_id);
+    let token_client = TokenClient::new(env, &invoice.token);
+    let merchant_balance = token_client.balance(&merchant_account);
+    if merchant_balance < amount_to_refund {
+        panic_with_error!(env, ContractError::InsufficientBalance);
+    }
+    let refund_client = MerchantAccountRefundClient::new(env, &merchant_account);
+    refund_client.refund(&invoice.token, &amount_to_refund, &payer);
+
+    // update invoice
+    let mut invoice = get_invoice(env, invoice_id);
+    invoice.amount_refunded += amount_to_refund;
+    invoice.status = InvoiceStatus::Refunded;
+    env.storage()
+        .persistent()
+        .set(&DataKey::Invoice(invoice_id), &invoice);
+
+    events::publish_invoice_refunded_event(
+        env,
+        invoice_id,
+        payer,
+        invoice.amount,
+        env.ledger().timestamp(),
+    );
 }
 
 pub fn get_invoices(env: &Env, filter: InvoiceFilter) -> Vec<Invoice> {
@@ -278,6 +346,7 @@ pub fn refund_invoice_partial(env: &Env, invoice_id: u64, amount: i128) {
     };
     invoice.status = new_status;
 
+    // save invoice to storage
     env.storage()
         .persistent()
         .set(&DataKey::Invoice(invoice_id), &invoice);
@@ -285,9 +354,16 @@ pub fn refund_invoice_partial(env: &Env, invoice_id: u64, amount: i128) {
     let payer = invoice
         .payer
         .clone()
-        .unwrap_or_else(|| panic_with_error!(env, ContractError::InvalidInvoiceStatus));
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::PayerNotAvailable));
 
     let merchant_account_addr = merchant::get_merchant_account(env, invoice.merchant_id);
+    // check if merchant account balance for the token is sufficient
+    let token_client = TokenClient::new(env, &invoice.token);
+    let merchant_balance = token_client.balance(&merchant_account_addr);
+    if merchant_balance < amount {
+        panic_with_error!(env, ContractError::InsufficientBalance);
+    }
+    // initiate refund
     let refund_client = MerchantAccountRefundClient::new(env, &merchant_account_addr);
     refund_client.refund(&invoice.token, &amount, &payer);
 

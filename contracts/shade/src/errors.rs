@@ -32,4 +32,7 @@ pub enum ContractError {
     ChargeTooEarly = 26,
     InvoiceExpired = 27,
     InvoiceNotPaid = 28,
+    PayerNotAvailable = 29,
+    InsufficientBalance = 30,
+    InsufficientAllowance = 31,
 }
